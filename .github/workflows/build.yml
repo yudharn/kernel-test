@@ -67,6 +67,29 @@ on:
         default: false
 
 
+      melt_blessing:
+        description: "Melt-Blessing patches — all: ZBlock + MG-LRU-lite + remove KCompressd/KShrink + kgsl __GFP_NORETRY | zblock-mglru | reverts | off"
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - zblock-mglru
+          - reverts
+          - "off"
+
+      perf_patches:
+        description: "WildKernels performance patches (19 patches from WildKernels/kernel_patches)"
+        required: true
+        type: boolean
+        default: true
+
+      nomount_metamodule:
+        description: "Build the NoMount metamodule zip from the same commit as the kernel side and attach it to the release"
+        required: true
+        type: boolean
+        default: true
+
       susfs_lkm_tag:
         description: "inforcqb/susfs4ksu-lkm tag to build the SuSFS LKM from (against this kernel). Leave empty for latest release."
         required: false
@@ -318,6 +341,23 @@ jobs:
           echo "KERNEL_BASE_VERSION=${KERNEL_BASE_VERSION}" >> $GITHUB_ENV
           echo "==> Detected kernel base version: ${KERNEL_BASE_VERSION}"
           cd ..
+
+      - name: Fetch extra patch sources (Melt-Blessing, WildKernels kernel_patches)
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/WeiguangTWK/Melt-Blessing-Patches.git melt-blessing-patches
+          MB_COMMIT=$(git -C melt-blessing-patches rev-parse --short HEAD)
+
+          git clone --depth=1 --filter=blob:none --sparse https://github.com/WildKernels/kernel_patches.git wild-kernel-patches
+          git -C wild-kernel-patches sparse-checkout set --no-cone /gki_ptrace.patch '/common/*.patch'
+          WKP_COMMIT=$(git -C wild-kernel-patches rev-parse --short HEAD)
+
+          {
+            echo "MB_COMMIT=${MB_COMMIT}"
+            echo "WKP_COMMIT=${WKP_COMMIT}"
+            echo "PATCH_HELPERS=${GITHUB_WORKSPACE}/scripts/patch-helpers.sh"
+          } >> "$GITHUB_ENV"
+          echo "==> Melt-Blessing-Patches@${MB_COMMIT}, WildKernels/kernel_patches@${WKP_COMMIT}"
 
       - name: Use resolved LLVM/Clang release
         run: |
@@ -576,6 +616,7 @@ jobs:
             echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> arch/arm64/configs/marble_defconfig
             echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> arch/arm64/configs/marble_defconfig
             echo "CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y" >> arch/arm64/configs/marble_defconfig
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> arch/arm64/configs/marble_defconfig
 
             # Some KernelSU trees (e.g. BakaSU) do not ship the Kconfig symbol for the priority UID filter
             # (upstream only adds it via 10_enable_susfs_for_ksu.patch). Without the symbol the =y above is ignored
@@ -591,6 +632,28 @@ jobs:
             else
               echo "==> SUSFS: KSU_SUSFS_PRIORITY_UID_FILTER symbol already defined by this tree"
             fi
+          fi
+
+          # Hiding fixes from WildKernels (ptrace leak + unicode bypass), applied in every mode
+          # (VANILLA's SuSFS LKM benefits too), then the optional performance patches.
+          echo "::group::WildKernels extras (ptrace/unicode fixes, performance patches)"
+          KP_DIR="${GITHUB_WORKSPACE}/wild-kernel-patches" PERF="${{ inputs.perf_patches }}" \
+          HELPERS="${PATCH_HELPERS}" \
+            bash "${GITHUB_WORKSPACE}/scripts/wild-extras.sh"
+          echo "::endgroup::"
+
+          # Melt-Blessing runs after SuSFS so the SuSFS patch always lands on an untouched tree;
+          # a Melt-Blessing patch that no longer fits is skipped with a warning instead of failing the build.
+          if [[ "${{ inputs.melt_blessing }}" != "off" ]]; then
+            echo "::group::Melt-Blessing patches (${{ inputs.melt_blessing }})"
+            MB_MODE="${{ inputs.melt_blessing }}" \
+            MB_DIR="${GITHUB_WORKSPACE}/melt-blessing-patches" \
+            PORT_DIR="${GITHUB_WORKSPACE}/patches/melt-blessing" \
+            HELPERS="${PATCH_HELPERS}" \
+              bash "${GITHUB_WORKSPACE}/scripts/melt-blessing.sh"
+            # the script wrote MB_* to GITHUB_ENV for later steps; this step needs them too
+            eval "$(grep -E '^MB_[A-Z]+=(true|false)$' "$GITHUB_ENV")"
+            echo "::endgroup::"
           fi
 
           if [[ "${{ env.NOMOUNT }}" == true ]]; then
@@ -706,6 +769,16 @@ jobs:
             echo "CONFIG_KALLSYMS_ALL=y" >> arch/arm64/configs/marble_defconfig
           fi
 
+          # Melt-Blessing: only switch the configs on for the parts whose patches actually landed.
+          # ZRAM_USE_ZBLOCK needs zram built in, so zram/zsmalloc move from prebuilt .ko into Image.
+          if [[ "${MB_ZBLOCK:-false}" == true ]]; then
+            printf '%s\n' CONFIG_ZPOOL=y CONFIG_ZSMALLOC=y CONFIG_ZRAM=y CONFIG_ZBLOCK=y CONFIG_ZRAM_USE_ZBLOCK=y \
+              >> arch/arm64/configs/marble_defconfig
+          fi
+          if [[ "${MB_MGLRU:-false}" == true ]]; then
+            echo "CONFIG_LRU_GEN=y" >> arch/arm64/configs/marble_defconfig
+          fi
+
           make O=out marble_defconfig
 
           if [[ "${{ env.SUSFS }}" == true ]]; then
@@ -716,7 +789,37 @@ jobs:
             fi
           fi
 
+          if [[ "${MB_ZBLOCK:-false}" == true ]]; then
+            if grep -q '^CONFIG_ZRAM=y' out/.config; then
+              echo "ZRAM_BUILTIN=true" >> $GITHUB_ENV
+            else
+              echo "::warning::Melt-Blessing: CONFIG_ZRAM did not resolve to =y, prebuilt zram.ko stays in AnyKernel3"
+            fi
+            grep -q '^CONFIG_ZRAM_USE_ZBLOCK=y' out/.config \
+              && echo "==> Melt-Blessing: ZRAM_USE_ZBLOCK is ON in out/.config" \
+              || echo "::warning::Melt-Blessing: ZRAM_USE_ZBLOCK is NOT enabled in out/.config"
+          fi
+          if [[ "${MB_MGLRU:-false}" == true ]]; then
+            grep -q '^CONFIG_LRU_GEN=y' out/.config \
+              && echo "==> Melt-Blessing: LRU_GEN (MG-LRU-lite) is ON in out/.config" \
+              || echo "::warning::Melt-Blessing: LRU_GEN is NOT enabled in out/.config"
+          fi
+
           make -j$(nproc) O=out KCFLAGS="-Wno-error=unused-function" CC="ccache ${CLANG_ROOT}/clang" HOSTCC="ccache ${CLANG_ROOT}/clang" Image
+
+          # kgsl is a module (msm_kgsl.ko) that AnyKernel3 ships prebuilt: rebuild it from this tree so the
+          # __GFP_NORETRY revert actually reaches the device. Symbols from other vendor modules are unknown here,
+          # hence KBUILD_MODPOST_WARN.
+          if [[ "${MB_KGSL:-false}" == true ]]; then
+            if make -j$(nproc) O=out KCFLAGS="-Wno-error=unused-function" CC="ccache ${CLANG_ROOT}/clang" HOSTCC="ccache ${CLANG_ROOT}/clang" \
+                 KBUILD_MODPOST_WARN=1 drivers/gpu/msm/msm_kgsl.ko; then
+              "${STRIP}" --strip-debug -o "${GITHUB_WORKSPACE}/msm_kgsl.ko" out/drivers/gpu/msm/msm_kgsl.ko
+              echo "KGSL_KO=${GITHUB_WORKSPACE}/msm_kgsl.ko" >> $GITHUB_ENV
+              echo "==> Melt-Blessing: rebuilt msm_kgsl.ko ($(du -h "${GITHUB_WORKSPACE}/msm_kgsl.ko" | cut -f1))"
+            else
+              echo "::warning::Melt-Blessing: msm_kgsl.ko build failed, AnyKernel3 keeps the prebuilt kgsl (no __GFP_NORETRY revert)"
+            fi
+          fi
 
 
           echo "ccache status after build:"
@@ -782,6 +885,11 @@ jobs:
 
           git clone --depth=1 -b Anykernel3 https://github.com/yudharn/AnyKernel3 AnyKernel3
 
+          # Keep the prebuilt module package in sync with Melt-Blessing (zram built in, KShrink gone, rebuilt kgsl)
+          if [[ "${ZRAM_BUILTIN:-false}" == true || "${MB_KSHRINK:-false}" == true || -n "${KGSL_KO:-}" ]]; then
+            bash "${GITHUB_WORKSPACE}/scripts/ak3-modules.sh" AnyKernel3
+          fi
+
           (cd ${SOC}/out/arch/arm64/boot && 7z a "${GITHUB_WORKSPACE}/AnyKernel3/Image.7z" Image)
           cp ${SOC}/out/arch/arm64/boot/Image ./Image
 
@@ -792,6 +900,53 @@ jobs:
           zip -r9 ../"${ZIP_NAME}.zip" * -x .git
 
           echo "ZIP_NAME=${ZIP_NAME}.zip" >> $GITHUB_ENV
+
+      - name: Set up Zig (NoMount metamodule)
+        if: ${{ inputs.nomount_metamodule && env.NOMOUNT == 'true' }}
+        continue-on-error: true
+        uses: mlugg/setup-zig@v2
+        with:
+          version: latest
+
+      - name: Build NoMount metamodule (same commit as the kernel side)
+        if: ${{ inputs.nomount_metamodule && env.NOMOUNT == 'true' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          SRC="${GITHUB_WORKSPACE}/${SOC}/NoMount"
+          [[ -d "${SRC}/.git" ]] || { echo "::warning::${SRC} missing, NoMount metamodule not built"; exit 0; }
+          NM_SHA=$(git -C "$SRC" rev-parse HEAD)
+
+          BUILD="${RUNNER_TEMP}/nomount-src"
+          MOD="${RUNNER_TEMP}/nomount-metamodule"
+          rm -rf "$BUILD" "$MOD"
+          git clone -q --no-checkout "$SRC" "$BUILD"
+          git -C "$BUILD" checkout -q --detach "$NM_SHA"
+          mkdir -p "$BUILD/bin"
+          (
+            cd "$BUILD/userspace/src"
+            # same flags as WildKernels' nomount-metamodule action (mirrors upstream NoMount CI)
+            zig cc -target aarch64-linux -Oz -mcmodel=tiny -static -ffreestanding \
+              -fno-unwind-tables -fno-ident -Wno-invalid-noreturn \
+              -mllvm -enable-machine-outliner=always nm.c -o ../../bin/nm-arm64
+            zig cc -target arm-linux -Oz -static -ffreestanding \
+              -fno-unwind-tables -fno-ident -Wno-invalid-noreturn \
+              -ffunction-sections -fdata-sections -Wl,--gc-sections \
+              nm.c -o ../../bin/nm-arm
+          )
+
+          cp -a "$BUILD/module" "$MOD"
+          mkdir -p "$MOD/bin"
+          install -m 0755 "$BUILD/bin/nm-arm64" "$MOD/bin/nm-arm64"
+          install -m 0755 "$BUILD/bin/nm-arm" "$MOD/bin/nm-arm"
+          sed -i "s/^versionCode=.*/versionCode=1/" "$MOD/module.prop"
+          printf '%s\n' "$NM_SHA" > "$MOD/NOMOUNT_SOURCE_COMMIT"
+
+          NM_VER=$(sed -n 's/^version=\(.*\)$/\1/p' "$MOD/module.prop" | head -n1)
+          OUT="NoMount-metamodule-${NM_VER:-unknown}-${NM_SHA:0:7}.zip"
+          (cd "$MOD" && zip -qr9 "${GITHUB_WORKSPACE}/${OUT}" .)
+          echo "NOMOUNT_MODULE_ZIP=${OUT}" >> "$GITHUB_ENV"
+          echo "==> ${OUT} (matches kernel-side NoMount ${NM_SHA:0:7})"
 
       - name: Build SuSFS LKM against this kernel (VANILLA)
         if: ${{ matrix.build_mode == 'VANILLA' }}
@@ -925,7 +1080,20 @@ jobs:
             --arg susfs_lkm_zip "${SUSFS_LKM_ZIP:-}" \
             --arg susfs_lkm_tag "${SUSFS_LKM_TAG:-}" \
             --arg susfs_lkm_url "${SUSFS_LKM_URL:-}" \
-            '{susfs_lkm_zip:$susfs_lkm_zip,susfs_lkm_tag:$susfs_lkm_tag,susfs_lkm_url:$susfs_lkm_url,manager_apk:$manager_apk,manager_apk_url:$manager_apk_url,manager_apk_match:$manager_apk_match,manager_apk_sha:$manager_apk_sha,ksu_type:$ksu_type,build_mode:$build_mode,kernel_name:$kernel_name,zip_name:$zip_name,ksu_manager_version:$ksu_manager_version,ksu_manager_commit:$ksu_manager_commit,ksu_manager_commit_url:$ksu_manager_commit_url,kernel_commit:$kernel_commit,kernel_commit_url:$kernel_commit_url,kernel_base_version:$kernel_base_version,clang_version:$clang_version,susfs_commit:$susfs_commit,susfs_commit_url:$susfs_commit_url,susfs_version_tag:$susfs_version_tag,nomount_commit:$nomount_commit,nomount_commit_url:$nomount_commit_url,nomount_version_tag:$nomount_version_tag}' \
+            --arg mb_commit "${MB_COMMIT:-}" \
+            --arg mb_zblock "${MB_ZBLOCK:-false}" \
+            --arg mb_mglru "${MB_MGLRU:-false}" \
+            --arg mb_kcompressd "${MB_KCOMPRESSD:-false}" \
+            --arg mb_kshrink "${MB_KSHRINK:-false}" \
+            --arg mb_kgsl "$([[ -n "${KGSL_KO:-}" ]] && echo true || echo false)" \
+            --arg zram_builtin "${ZRAM_BUILTIN:-false}" \
+            --arg wkp_commit "${WKP_COMMIT:-}" \
+            --arg ptrace_fix "${PTRACE_FIX:-false}" \
+            --arg unicode_fix "${UNICODE_FIX:-false}" \
+            --arg perf_ok "${PERF_OK:-0}" \
+            --arg perf_failed "${PERF_FAILED:-}" \
+            --arg nomount_module_zip "${NOMOUNT_MODULE_ZIP:-}" \
+            '{mb_commit:$mb_commit,mb_zblock:$mb_zblock,mb_mglru:$mb_mglru,mb_kcompressd:$mb_kcompressd,mb_kshrink:$mb_kshrink,mb_kgsl:$mb_kgsl,zram_builtin:$zram_builtin,wkp_commit:$wkp_commit,ptrace_fix:$ptrace_fix,unicode_fix:$unicode_fix,perf_ok:$perf_ok,perf_failed:$perf_failed,nomount_module_zip:$nomount_module_zip,susfs_lkm_zip:$susfs_lkm_zip,susfs_lkm_tag:$susfs_lkm_tag,susfs_lkm_url:$susfs_lkm_url,manager_apk:$manager_apk,manager_apk_url:$manager_apk_url,manager_apk_match:$manager_apk_match,manager_apk_sha:$manager_apk_sha,ksu_type:$ksu_type,build_mode:$build_mode,kernel_name:$kernel_name,zip_name:$zip_name,ksu_manager_version:$ksu_manager_version,ksu_manager_commit:$ksu_manager_commit,ksu_manager_commit_url:$ksu_manager_commit_url,kernel_commit:$kernel_commit,kernel_commit_url:$kernel_commit_url,kernel_base_version:$kernel_base_version,clang_version:$clang_version,susfs_commit:$susfs_commit,susfs_commit_url:$susfs_commit_url,susfs_version_tag:$susfs_version_tag,nomount_commit:$nomount_commit,nomount_commit_url:$nomount_commit_url,nomount_version_tag:$nomount_version_tag}' \
             > "${GITHUB_WORKSPACE}/metadata.json"
 
       - name: Upload build artifact
@@ -937,6 +1105,7 @@ jobs:
             metadata.json
             *_Manager_*.apk
             SuSFS-LKM_*.zip
+            NoMount-metamodule-*.zip
           if-no-files-found: ignore
           retention-days: 1
 
@@ -997,7 +1166,24 @@ jobs:
               NOMOUNT_COMMIT=$(jq -r '.nomount_commit' "$META")
               NOMOUNT_COMMIT_URL=$(jq -r '.nomount_commit_url' "$META")
               NOMOUNT_VERSION_TAG=$(jq -r '.nomount_version_tag' "$META")
+              MB_COMMIT=$(jq -r '.mb_commit // ""' "$META")
+              MB_ZBLOCK=$(jq -r '.mb_zblock // "false"' "$META")
+              MB_MGLRU=$(jq -r '.mb_mglru // "false"' "$META")
+              MB_KCOMPRESSD=$(jq -r '.mb_kcompressd // "false"' "$META")
+              MB_KSHRINK=$(jq -r '.mb_kshrink // "false"' "$META")
+              MB_KGSL=$(jq -r '.mb_kgsl // "false"' "$META")
+              WKP_COMMIT=$(jq -r '.wkp_commit // ""' "$META")
+              PTRACE_FIX=$(jq -r '.ptrace_fix // "false"' "$META")
+              UNICODE_FIX=$(jq -r '.unicode_fix // "false"' "$META")
+              PERF_OK=$(jq -r '.perf_ok // "0"' "$META")
+              PERF_FAILED=$(jq -r '.perf_failed // ""' "$META")
               FIRST=false
+            fi
+
+            NM_ZIP=$(jq -r '.nomount_module_zip // ""' "$META")
+            if [[ -n "$NM_ZIP" && -f "${dir}${NM_ZIP}" && -z "${NOMOUNT_MODULE_ZIP:-}" ]]; then
+              NOMOUNT_MODULE_ZIP="$NM_ZIP"
+              ASSETS+=("${dir}${NM_ZIP}")
             fi
 
             if [[ -z "${SUSFS_COMMIT:-}" && -n "$(jq -r '.susfs_commit' "$META")" ]]; then
@@ -1097,6 +1283,25 @@ jobs:
             vanilla_susfs_cell="❌"
           fi
 
+          yn() { [[ "$1" == true ]] && echo "✅" || echo "❌"; }
+          if [[ "${{ inputs.melt_blessing }}" == "off" ]]; then
+            mb_cell="Off"
+          else
+            mb_cell="ZBlock $(yn "$MB_ZBLOCK") · MG-LRU-lite $(yn "$MB_MGLRU") · no KCompressd $(yn "$MB_KCOMPRESSD") · no KShrink $(yn "$MB_KSHRINK") · kgsl NORETRY $(yn "$MB_KGSL") ([Melt-Blessing-Patches@${MB_COMMIT}](https://github.com/WeiguangTWK/Melt-Blessing-Patches/commit/${MB_COMMIT}))"
+          fi
+          hide_cell="Ptrace leak fix $(yn "$PTRACE_FIX") · Unicode bypass fix $(yn "$UNICODE_FIX") · SuSFS OPEN_REDIRECT ✅"
+          if [[ "${{ inputs.perf_patches }}" == true ]]; then
+            perf_cell="${PERF_OK} patches ([WildKernels/kernel_patches@${WKP_COMMIT}](https://github.com/WildKernels/kernel_patches/commit/${WKP_COMMIT}))"
+            [[ -n "$PERF_FAILED" ]] && perf_cell="${perf_cell}, skipped: ${PERF_FAILED}"
+          else
+            perf_cell="Off"
+          fi
+          if [[ -n "${NOMOUNT_MODULE_ZIP:-}" ]]; then
+            nomount_module_cell="\`${NOMOUNT_MODULE_ZIP}\` (built from the same NoMount commit as the kernel)"
+          else
+            nomount_module_cell="—"
+          fi
+
           BUILD_TIME=$(date -u +"%Y%m%d_%H%M")
           REL_NAME="${KERNEL_BASE_VERSION}-${KERNEL_NAME}-${BUILD_TIME}"
 
@@ -1119,6 +1324,10 @@ jobs:
            | ⚙️ Re-Kernel (Netlink) | ${rekernel_netlink_checkbox}
            | ⚙️ Re-Kernel (eBPF) | ${rekernel_ebpf_checkbox}
            | 🗂️ NoMount | ${nomount_checkbox}
+           | 📦 NoMount metamodule | ${nomount_module_cell} |
+           | 🧠 Melt-Blessing | ${mb_cell} |
+           | 🕵️ Hiding fixes | ${hide_cell} |
+           | ⚡ Performance patches | ${perf_cell} |
            | 🧩 eBPF | Enabled (BTF/CO-RE, kprobe+uprobe, cgroup+tc hooks) |
            | 🔨 Compiler | ${CLANG_VERSION} |
 
